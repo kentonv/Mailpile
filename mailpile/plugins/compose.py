@@ -13,15 +13,67 @@ from mailpile.plugins.tags import Tag
 from mailpile.mailutils import ExtractEmails, ExtractEmailAndName, Email
 from mailpile.mailutils import NotEditableError
 from mailpile.mailutils import NoFromAddressError, PrepareMessage
-from mailpile.smtp_client import SendMail
 from mailpile.search import MailIndex
 from mailpile.urlmap import UrlMap
 from mailpile.util import *
 
 from mailpile.plugins.search import Search, SearchResults, View
 
+import capnp
+import email_capnp
 
 _plugins = PluginManager(builtin=__file__)
+
+
+# TODO: move capnp stuff out of global/import scope
+class Fd(object):
+    def __init__(self, fd):
+        self.fileno = lambda: fd
+
+client = capnp.TwoPartyClient(Fd(4))
+email_cap = client.ez_restore('SessionContext').cast_as(email_capnp.EmailSendPort)
+
+
+def SendMail(message_tuple):
+    def split_address(raw_address, is_list=False):
+        if not isinstance(raw_address, basestring):
+            return [split_address(x) for x in raw_address]
+
+        if '<' not in raw_address:
+            ret = {'address': raw_address}
+            if is_list is True:
+                ret = [ret]
+            return ret
+
+        ind = raw_address.rfind('<')
+
+        name, address = raw_address[:ind].strip(), raw_address[ind + 1:-1].strip()
+        ret = {'name': name, 'address': address}
+        if is_list is True:
+            ret = [ret]
+
+        return ret
+
+    raw_email = message_tuple[2]
+    req = email_cap.send_request()
+    email = req.email
+    email.to = split_address(raw_email['To'], is_list=True)
+    setattr(email, 'from', split_address(raw_email['From']))  # deal with from being a reserved keyword
+    email.subject = raw_email['Subject']
+    # TODO: add other headers
+    payloads = raw_email.get_payload()
+    if type(payloads) is list:
+        for payload in payloads:
+            if payload['Content-Type'].startswith('text/plain'):
+                email.text = payload.get_payload()
+            elif payload['Content-Type'].startswith('text/html'):
+                email.html = payload.get_payload()
+            else:
+                pass  # TODO: add as attachments
+    else:
+        email.text = payloads.get_payload()
+
+    req.send().wait()
 
 
 class EditableSearchResults(SearchResults):
@@ -595,10 +647,10 @@ class Sendit(CompositionCommand):
                         message=_('Sending message'),
                         data={'mid': msg_mid, 'sid': msg_sid}))
 
-                SendMail(session, [PrepareMessage(config,
-                                                  email.get_msg(pgpmime=False),
-                                                  rcpts=(bounce_to or None),
-                                                  events=events)])
+                SendMail(PrepareMessage(config,
+                                        email.get_msg(pgpmime=False),
+                                        rcpts=(bounce_to or None),
+                                        events=events))
                 for ev in events:
                     ev.flags = Event.COMPLETE
                     config.event_log.log_event(ev)
